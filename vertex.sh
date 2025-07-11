@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具
-# 支持 Gemini API 和 Vertex AI
-# 版本: 2.0.0
+# 支持 Vertex AI
+# 版本: 8.8.8
 
 # 仅启用 errtrace (-E) 与 nounset (-u)
 set -Euo
@@ -211,9 +211,29 @@ unique_suffix() {
 # 生成项目ID
 new_project_id() {
     local prefix="${1:-$PROJECT_PREFIX}"
+    
+    # 优先使用邮箱用户名生成项目ID
+    local active_account
+    active_account=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n 1)
+    
+    local base_name
+    if [ -n "$active_account" ]; then
+        # 从邮箱提取用户名，并进行清理
+        base_name=$(echo "$active_account" | cut -d'@' -f1 | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/-*$//g')
+    else
+        # 如果无法获取邮箱，则使用传入的前缀或默认前缀
+        base_name="$prefix"
+    fi
+    
+    # 添加日期和唯一后缀
     local suffix
-    suffix=$(unique_suffix)
-    echo "${prefix}-${suffix}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-30
+    suffix=$(date +%m%d)-$(unique_suffix)
+    
+    local full_id="${base_name}-${suffix}"
+    
+    # 清理并确保符合GCP项目ID规范 (6-30个字符, 小写字母, 数字, 连字符)
+    # 最后的sed确保ID不以连字符结尾
+    echo "$full_id" | sed -e 's/[^a-z0-9-]/-/g' -e 's/^-*//' | cut -c1-30 | sed 's/-*$//'
 }
 
 # 安全检测服务是否已启用
