@@ -701,8 +701,10 @@ vertex_main() {
             fi
             
             log "INFO" "关联结算账户到 ${new_project_id}..."
-            if ! retry gcloud billing projects link "$new_project_id" --billing-account="$BILLING_ACCOUNT" --quiet; then
-                log "ERROR" "关联结算账户失败: ${new_project_id}"
+            retry gcloud billing projects link "$new_project_id" --billing-account="$BILLING_ACCOUNT" --quiet
+            local exit_code=$?
+            if [ ${exit_code} -ne 0 ]; then
+                log "ERROR" "关联结算账户失败: ${new_project_id} (退出码: ${exit_code})"
                 gcloud projects delete "$new_project_id" --quiet 2>/dev/null
                 return 1
             fi
