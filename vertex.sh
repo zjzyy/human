@@ -261,6 +261,42 @@ safe_exec() {
     return 0
 }
 
+# 并行处理单个项目的函数
+# @param $1: project_id
+# @param $2: temp_dir
+# @param $3: job_num
+# @param $4: total_jobs
+process_project() {
+    local project_id="$1"
+    local temp_dir="$2"
+    local current_job_num="$3"
+    local total_jobs="$4"
+
+    # 将此作业的日志重定向到单独的文件以避免输出混乱
+    local job_log="${temp_dir}/job_${project_id}.log"
+    
+    {
+        log "INFO" "[并行任务 ${current_job_num}/${total_jobs}] 开始处理项目: ${project_id}"
+        
+        if ! enable_services "$project_id"; then
+            log "ERROR" "为项目 ${project_id} 启用API失败。跳过此项目。"
+            echo "${project_id}" >> "${temp_dir}/failed.txt"
+            return 1
+        fi
+
+        local key_file_path
+        key_file_path=$(vertex_setup_service_account "$project_id")
+        
+        if [ -n "$key_file_path" ] && [ -f "$key_file_path" ]; then
+            log "SUCCESS" "成功为项目 ${project_id} 生成密钥。"
+            echo "${key_file_path}" >> "${temp_dir}/success.txt"
+        else
+            log "ERROR" "为项目 ${project_id} 生成密钥失败。"
+            echo "${project_id}" >> "${temp_dir}/failed.txt"
+        fi
+    } &>> "$job_log" # 追加模式，以防重试时覆盖
+}
+
 # 检查环境
 check_env() {
     log "INFO" "检查环境配置..."
@@ -378,30 +414,15 @@ enable_services() {
         )
     fi
     
-    log "INFO" "为项目 ${proj} 启用必要的API服务..."
-    
-    local failed=0
-    for svc in "${services[@]}"; do
-        if is_service_enabled "$proj" "$svc"; then
-            log "INFO" "服务 ${svc} 已启用"
-            continue
-        fi
-        
-        log "INFO" "启用服务: ${svc}"
-        if retry gcloud services enable "$svc" --project="$proj" --quiet; then
-            log "SUCCESS" "成功启用服务: ${svc}"
-        else
-            log "ERROR" "无法启用服务: ${svc}"
-            failed=$((failed + 1)) || true
-        fi
-    done
-    
-    if [ $failed -gt 0 ]; then
-        log "WARN" "有 ${failed} 个服务启用失败"
+    log "INFO" "为项目 ${proj} 批量启用 ${#services[@]} 个API服务..."
+
+    if retry gcloud services enable "${services[@]}" --project="$proj" --quiet; then
+        log "SUCCESS" "成功为项目 ${proj} 批量启用服务"
+        return 0
+    else
+        log "ERROR" "为项目 ${proj} 批量启用服务失败"
         return 1
     fi
-    
-    return 0
 }
 
 # 进度条显示
@@ -679,23 +700,18 @@ vertex_main() {
       echo
     fi
     
-    # 自动查找并配置项目
-    log "INFO" "自动查找与结算账户 ${BILLING_ACCOUNT} 关联的项目..."
-    local all_projects
-    all_projects=$(gcloud projects list --format='value(projectId)' --filter="lifecycleState=ACTIVE" 2>/dev/null || echo "")
+    # 自动查找与配置项目
+    log "INFO" "快速查找与结算账户 ${BILLING_ACCOUNT} 关联的项目..."
+    
+    local billed_projects_str
+    billed_projects_str=$(gcloud projects list \
+        --filter="billingInfo.billingAccountName=billingAccounts/${BILLING_ACCOUNT} AND lifecycleState=ACTIVE" \
+        --format="value(projectId)" 2>/dev/null)
 
     local billed_projects=()
-    if [ -n "$all_projects" ]; then
-        while IFS= read -r project_id; do
-            if [ -n "$project_id" ]; then
-                local billing_info
-                billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
-                
-                if [ -n "$billing_info" ] && [[ "$billing_info" == *"${BILLING_ACCOUNT}"* ]]; then
-                    billed_projects+=("$project_id")
-                fi
-            fi
-        done <<< "$all_projects"
+    if [ -n "$billed_projects_str" ]; then
+        # 使用 readarray 将输出按行读入数组
+        readarray -t billed_projects <<< "$billed_projects_str"
     fi
 
     local existing_project_count=${#billed_projects[@]}
@@ -738,41 +754,58 @@ vertex_main() {
     
     # 选择所需数量的项目进行处理
     local projects_to_process=("${billed_projects[@]:0:${num_to_process}}")
-    log "INFO" "将为以下 ${#projects_to_process[@]} 个项目生成Vertex AI密钥:"
+    log "INFO" "将为以下 ${#projects_to_process[@]} 个项目并行生成Vertex AI密钥:"
     printf -- " - %s\n" "${projects_to_process[@]}"
     echo
 
-    # 为这3个项目生成密钥
+    # 为这些项目生成密钥（并行处理）
     local generated_key_files=()
     local success_count=0
     local failure_count=0
+    
+    # 清理临时结果文件
+    rm -f "${TEMP_DIR}/success.txt" "${TEMP_DIR}/failed.txt" "${TEMP_DIR}/job_"*.log
+    touch "${TEMP_DIR}/success.txt" "${TEMP_DIR}/failed.txt"
+
     local current=0
     local total=${#projects_to_process[@]}
 
     for project_id in "${projects_to_process[@]}"; do
         current=$((current + 1))
-        log "INFO" "[${current}/${total}] 开始处理项目: ${project_id}"
         
-        log "INFO" "启用API..."
-        if ! enable_services "$project_id"; then
-            log "ERROR" "为项目 ${project_id} 启用API失败。跳过此项目。"
-            failure_count=$((failure_count + 1))
-            continue
-        fi
+        # 当后台任务达到最大并发数时，等待一个任务完成
+        while (( $(jobs -p | wc -l) >= MAX_PARALLEL_JOBS )); do
+            sleep 1
+        done
 
-        log "INFO" "创建服务账号和密钥..."
-        local key_file_path
-        key_file_path=$(vertex_setup_service_account "$project_id")
-        
-        if [ -n "$key_file_path" ] && [ -f "$key_file_path" ]; then
-            log "SUCCESS" "成功为项目 ${project_id} 生成密钥。"
-            generated_key_files+=("$key_file_path")
-            success_count=$((success_count + 1))
-        else
-            log "ERROR" "为项目 ${project_id} 生成密钥失败。"
-            failure_count=$((failure_count + 1))
+        process_project "$project_id" "$TEMP_DIR" "$current" "$total" &
+    done
+
+    log "INFO" "所有任务已启动，等待全部完成..."
+    wait
+
+    # 从临时文件收集结果
+    log "INFO" "所有任务完成，正在汇总并打印日志..."
+    
+    # 按顺序打印每个作业的日志
+    for project_id in "${projects_to_process[@]}"; do
+        local log_file="${TEMP_DIR}/job_${project_id}.log"
+        if [ -f "$log_file" ]; then
+            cat "$log_file"
         fi
     done
+
+    while IFS= read -r key_file; do
+        [ -n "$key_file" ] && generated_key_files+=("$key_file")
+    done < "${TEMP_DIR}/success.txt"
+    
+    local failed_projects=()
+    while IFS= read -r project_id; do
+        [ -n "$project_id" ] && failed_projects+=("$project_id")
+    done < "${TEMP_DIR}/failed.txt"
+
+    success_count=${#generated_key_files[@]}
+    failure_count=${#failed_projects[@]}
 
     # 打印结果和密钥内容
     echo
