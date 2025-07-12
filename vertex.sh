@@ -1,7 +1,7 @@
 #!/bin/bash
 # 优化的 GCP API 密钥管理工具
-# 支持 Vertex AI
-# 版本: 8.8.8
+# 支持 Gemini API 和 Vertex AI
+# 版本: 2.0.0
 
 # 仅启用 errtrace (-E) 与 nounset (-u)
 set -Euo
@@ -608,6 +608,7 @@ write_keys_to_files() {
 
 # Vertex主菜单
 vertex_main() {
+    local num_to_process="${1:-1}" # 从参数获取数量，默认为1
     local start_time=$SECONDS
     
     echo -e "\n${CYAN}${BOLD}======================================================"
@@ -700,11 +701,11 @@ vertex_main() {
     local existing_project_count=${#billed_projects[@]}
     log "INFO" "找到 ${existing_project_count} 个已关联的项目."
 
-    # 如果项目少于3个，则创建新的
+    # 如果项目少于所需数量，则创建新的
     local projects_to_create=0
-    if [ "$existing_project_count" -lt 3 ]; then
-        projects_to_create=$((3 - existing_project_count))
-        log "INFO" "项目数量不足3个，将创建 ${projects_to_create} 个新项目."
+    if [ "$existing_project_count" -lt "$num_to_process" ]; then
+        projects_to_create=$((num_to_process - existing_project_count))
+        log "INFO" "项目数量不足${num_to_process}个，将创建 ${projects_to_create} 个新项目."
     fi
 
     if [ "$projects_to_create" -gt 0 ]; then
@@ -735,9 +736,9 @@ vertex_main() {
         done
     fi
     
-    # 选择前3个项目进行处理
-    local projects_to_process=("${billed_projects[@]:0:3}")
-    log "INFO" "将为以下3个项目生成Vertex AI密钥:"
+    # 选择所需数量的项目进行处理
+    local projects_to_process=("${billed_projects[@]:0:${num_to_process}}")
+    log "INFO" "将为以下 ${#projects_to_process[@]} 个项目生成Vertex AI密钥:"
     printf -- " - %s\n" "${projects_to_process[@]}"
     echo
 
@@ -792,13 +793,6 @@ vertex_main() {
     # 显示执行时间
     local duration=$((SECONDS - start_time))
     log "INFO" "操作完成，耗时: $((duration / 60))分$((duration % 60))秒"
-    
-    # 询问是否返回主菜单或退出
-    if ask_yes_no "返回主菜单？(选择 '否' 将退出)" "Y"; then
-        return 0
-    else
-        exit 0
-    fi
 }
 
 # 配置Vertex服务账号
@@ -1462,7 +1456,7 @@ show_menu() {
     echo
     
     # 直接进入 Vertex AI 管理
-    vertex_main
+    vertex_main "$@"
 }
 
 
@@ -1470,22 +1464,47 @@ show_menu() {
 # ===== 主程序入口 =====
 
 main() {
+    local num_to_process=1 # 默认处理1个
+
+    # 解析命令行参数
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n|--count)
+                if [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ]; then
+                    num_to_process="$2"
+                    shift 2
+                else
+                    log "ERROR" "参数 '$1' 需要一个正整数值"
+                    exit 1
+                fi
+                ;;
+            -h|--help)
+                echo "用法: $0 [-n COUNT]"
+                echo "  -n, --count    要生成并打印JSON密钥的项目数量 (默认为 1)"
+                echo "  -h, --help     显示此帮助信息"
+                exit 0
+                ;;
+            *)
+                log "ERROR" "未知选项: $1. 使用 -h 或 --help 查看帮助."
+                exit 1
+                ;;
+        esac
+    done
+
     # 显示欢迎信息
     echo -e "${CYAN}${BOLD}"
     echo "╔═══════════════════════════════════════════════════════╗"
     echo "║          GCP API 密钥管理工具 v${VERSION}                  ║"
     echo "║                                                       ║"
-    echo "║              只TMD支持  Vertex AI                     ║"
+    echo "║                  Vertex AI 专用版                     ║"
     echo "╚═══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     
     # 检查环境
     check_env
     
-    # 主循环
-    while true; do
-        show_menu
-    done
+    # 运行主程序逻辑，传递参数
+    show_menu "$num_to_process"
 }
 
 # 运行主程序
