@@ -288,13 +288,24 @@ process_project() {
         key_file_path=$(vertex_setup_service_account "$project_id")
         
         if [ -n "$key_file_path" ] && [ -f "$key_file_path" ]; then
-            log "SUCCESS" "成功为项目 ${project_id} 生成密钥。"
-            echo "${key_file_path}" >> "${temp_dir}/success.txt"
+            log "SUCCESS" "成功为项目 ${project_id} 生成服务账号密钥。"
+            
+            local api_key
+            api_key=$(create_and_print_api_key "$project_id")
+            if [ -n "$api_key" ]; then
+                log "SUCCESS" "成功为项目 ${project_id} 生成API Key。"
+                # 将服务账号密钥路径和API Key在同一行写入，用':::'分隔
+                echo "${key_file_path}:::${api_key}" >> "${temp_dir}/success.txt"
+            else
+                log "WARN" "为项目 ${project_id} 生成API Key失败，但服务账号密钥已生成。"
+                # 即使API Key失败，也记录下成功的服务账号密钥
+                echo "${key_file_path}:::" >> "${temp_dir}/success.txt"
+            fi
         else
             log "ERROR" "为项目 ${project_id} 生成密钥失败。"
             echo "${project_id}" >> "${temp_dir}/failed.txt"
         fi
-    } &>> "$job_log" # 追加模式，以防重试时覆盖
+    } >> "$job_log" 2>&1 # 追加模式，以防重试时覆盖
 }
 
 # 检查环境
@@ -518,6 +529,45 @@ parse_json() {
     
     log "WARN" "JSON解析: 无法提取字段 $field"
     return 1
+}
+
+# 新增函数：创建并打印 API Key
+create_and_print_api_key() {
+    local project_id="$1"
+    log "INFO" "为项目 ${project_id} 创建 API Key..."
+
+    # 启用 generativelanguage.googleapis.com API
+    if ! is_service_enabled "$project_id" "generativelanguage.googleapis.com"; then
+        log "INFO" "启用 generativelanguage.googleapis.com API..."
+        if ! retry gcloud services enable "generativelanguage.googleapis.com" --project="$project_id" --quiet; then
+            log "ERROR" "启用 generativelanguage.googleapis.com API 失败"
+            return 1
+        fi
+    fi
+
+    local key_json
+    key_json=$(gcloud alpha services api-keys create \
+        --project="$project_id" \
+        --display-name="AI Studio Key" \
+        --format=json 2>/dev/null)
+
+    if [ -z "$key_json" ]; then
+        log "ERROR" "创建 API Key 失败，未收到gcloud的返回信息。"
+        return 1
+    fi
+
+    local key_string
+    key_string=$(parse_json "$key_json" ".keyString")
+
+    if [ -n "$key_string" ]; then
+        log "SUCCESS" "成功创建 API Key"
+        echo "$key_string"
+        return 0
+    else
+        log "ERROR" "无法从 gcloud 返回的 JSON 中解析出 API Key"
+        log "ERROR" "gcloud 返回内容: $key_json"
+        return 1
+    fi
 }
 
 # 清理旧的服务账号密钥
@@ -795,30 +845,57 @@ vertex_main() {
         fi
     done
 
-    while IFS= read -r key_file; do
-        [ -n "$key_file" ] && generated_key_files+=("$key_file")
+    # 读取成功记录
+    local success_records=()
+     while IFS= read -r line; do
+        [ -n "$line" ] && success_records+=("$line")
     done < "${TEMP_DIR}/success.txt"
-    
+
     local failed_projects=()
     while IFS= read -r project_id; do
         [ -n "$project_id" ] && failed_projects+=("$project_id")
     done < "${TEMP_DIR}/failed.txt"
 
-    success_count=${#generated_key_files[@]}
-    failure_count=${#failed_projects[@]}
+    local success_count=${#success_records[@]}
+    local failure_count=${#failed_projects[@]}
 
     # 打印结果和密钥内容
     echo
     log "INFO" "操作完成！成功: ${success_count}, 失败: ${failure_count}."
 
-    if [ ${#generated_key_files[@]} -gt 0 ]; then
+    if [ ${#success_records[@]} -gt 0 ]; then
         log "INFO" "打印生成的密钥内容:"
-        for key_file in "${generated_key_files[@]}"; do
+        for record in "${success_records[@]}"; do
+            # 解析记录，格式为: /path/to/key.json:::API_KEY_STRING
+            local sa_key_path
+            local api_key
+            sa_key_path=$(echo "$record" | cut -d: -f1-3) # 假定路径中可能也有冒号
+            api_key=$(echo "$record" | cut -d: -f4-)
+            
+            # 修正解析方法
+            sa_key_path=$(echo "$record" | awk -F':::' '{print $1}')
+            api_key=$(echo "$record" | awk -F':::' '{print $2}')
+
+
             local proj_id
-            # 从文件名中提取项目ID (e.g., keys/project-abc-123-vertex-admin-....json -> project-abc-123)
-            proj_id=$(basename "$key_file" | sed -E "s/(${VERTEX_PROJECT_PREFIX}|${PROJECT_PREFIX})-[a-z0-9]+-[a-z0-9]+.*/\0/" | sed -E "s/-${SERVICE_ACCOUNT_NAME}-.*//")
-            echo -e "\n${PURPLE}${BOLD}===== 密钥: $(basename "$key_file") (项目: ${proj_id}) =====${NC}"
-            cat "$key_file"
+            proj_id=$(basename "$sa_key_path" | sed -E "s/(${VERTEX_PROJECT_PREFIX}|${PROJECT_PREFIX})-[a-z0-9]+-[a-z0-9]+.*/\0/" | sed -E "s/-${SERVICE_ACCOUNT_NAME}-.*//")
+
+            echo -e "\n${PURPLE}${BOLD}===== 项目: ${proj_id} =====${NC}"
+
+            # 打印服务账号JSON密钥
+            if [ -n "$sa_key_path" ] && [ -f "$sa_key_path" ]; then
+                echo -e "${CYAN}--- 服务账号 (JSON Key) ---${NC}"
+                echo -e "路径: ${sa_key_path}"
+                cat "$sa_key_path"
+                echo
+            fi
+
+            # 打印API Key
+            if [ -n "$api_key" ]; then
+                echo -e "${CYAN}--- AI Studio (API Key) ---${NC}"
+                echo -e "密钥: ${api_key}"
+            fi
+
             echo -e "${PURPLE}${BOLD}========================================================================${NC}"
         done
     fi
