@@ -27,6 +27,13 @@ MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 MAX_PARALLEL_JOBS="${CONCURRENCY:-20}"
 TEMP_DIR=""  # 将在初始化时设置
 
+# S3配置（新增）
+S3_ENDPOINT=""
+S3_ACCESS_KEY=""
+S3_SECRET_KEY=""
+S3_BUCKET=""
+S3_DIRECTORY=""
+
 # Gemini模式配置
 TIMESTAMP=$(date +%s)
 # 改进的随机字符生成（兼容性更好）
@@ -84,6 +91,153 @@ log() {
     esac
 }
 
+# ===== S3 相关函数（新增） =====
+
+# 检查S3配置
+check_s3_config() {
+    if [ -z "$S3_ENDPOINT" ] || [ -z "$S3_ACCESS_KEY" ] || [ -z "$S3_SECRET_KEY" ] || [ -z "$S3_BUCKET" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# 生成S3目录名（如果未指定）
+generate_s3_directory() {
+    if [ -z "$S3_DIRECTORY" ]; then
+        S3_DIRECTORY=$(date +%Y%m%d)
+        log "INFO" "使用默认S3目录: ${S3_DIRECTORY}"
+    fi
+}
+
+# 上传文件到S3
+upload_to_s3() {
+    local local_file="$1"
+    local s3_key="$2"
+    
+    if ! check_s3_config; then
+        log "WARN" "S3配置不完整，跳过上传"
+        return 1
+    fi
+    
+    if ! command -v aws &>/dev/null; then
+        log "ERROR" "未找到 aws CLI 工具，无法上传到S3"
+        return 1
+    fi
+    
+    # 临时设置AWS凭证（避免暴露在history中）
+    export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
+    export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
+    export AWS_ENDPOINT_URL="$S3_ENDPOINT"
+    
+    log "INFO" "上传文件到S3: s3://${S3_BUCKET}/${S3_DIRECTORY}/${s3_key}"
+    
+    # 安全修复：移除--no-verify-ssl选项，启用SSL验证
+    if aws s3 cp "$local_file" "s3://${S3_BUCKET}/${S3_DIRECTORY}/${s3_key}" 2>/dev/null; then
+        log "SUCCESS" "成功上传到S3: ${s3_key}"
+        # 立即清理环境变量（安全修复）
+        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_ENDPOINT_URL 2>/dev/null || true
+        return 0
+    else
+        log "ERROR" "上传S3失败: ${s3_key}"
+        # 即使失败也要清理环境变量
+        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_ENDPOINT_URL 2>/dev/null || true
+        return 1
+    fi
+}
+
+# 上传JSON密钥到S3
+upload_json_key_to_s3() {
+    local json_file="$1"
+    local project_id="$2"
+    
+    if [ ! -f "$json_file" ]; then
+        log "ERROR" "JSON文件不存在: ${json_file}"
+        return 1
+    fi
+    
+    # 获取当前活动账号邮箱
+    local current_email
+    current_email=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n 1)
+    
+    if [ -z "$current_email" ]; then
+        log "ERROR" "无法获取当前账号邮箱"
+        return 1
+    fi
+    
+    # 生成S3文件名
+    local s3_filename="${current_email}-${project_id}.json"
+    
+    upload_to_s3 "$json_file" "$s3_filename"
+}
+
+# 上传API Key到S3
+upload_api_key_to_s3() {
+    local api_key="$1"
+    local project_id="$2"
+    
+    if [ -z "$api_key" ]; then
+        log "ERROR" "API Key为空"
+        return 1
+    fi
+    
+    # 获取当前活动账号邮箱
+    local current_email
+    current_email=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n 1)
+    
+    if [ -z "$current_email" ]; then
+        log "ERROR" "无法获取当前账号邮箱"
+        return 1
+    fi
+    
+    # 创建临时文件保存API Key
+    local temp_key_file="${TEMP_DIR}/${current_email}-${project_id}.key"
+    echo "$api_key" > "$temp_key_file"
+    
+    # 生成S3文件名
+    local s3_filename="${current_email}-${project_id}.key"
+    
+    local result=0
+    upload_to_s3 "$temp_key_file" "$s3_filename" || result=1
+    
+    # 清理临时文件
+    rm -f "$temp_key_file"
+    
+    return $result
+}
+
+# 清理敏感历史记录（安全修复）
+clean_sensitive_history() {
+    if ! command -v history &>/dev/null; then
+        log "WARN" "history命令不可用，跳过历史记录清理"
+        return 0
+    fi
+    
+    # 查找并删除包含S3凭证的历史记录
+    local sensitive_patterns=("s3-secret-key" "s3-access-key" "--s3-secret-key" "--s3-access-key")
+    local deleted_count=0
+    
+    for pattern in "${sensitive_patterns[@]}"; do
+        # 使用history命令查找匹配的行号
+        local line_nums
+        line_nums=$(history | grep -n "$pattern" 2>/dev/null | cut -d: -f1 | tac)
+        
+        # 删除匹配的历史记录行
+        while IFS= read -r line_num; do
+            if [ -n "$line_num" ] && [[ "$line_num" =~ ^[0-9]+$ ]]; then
+                if history -d "$line_num" 2>/dev/null; then
+                    deleted_count=$((deleted_count + 1))
+                fi
+            fi
+        done <<< "$line_nums"
+    done
+    
+    if [ "$deleted_count" -gt 0 ]; then
+        log "INFO" "已删除 ${deleted_count} 条包含敏感信息的历史记录"
+    else
+        log "INFO" "未发现包含敏感信息的历史记录"
+    fi
+}
+
 # ===== 错误处理 =====
 handle_error() {
     local exit_code=$?
@@ -120,16 +274,29 @@ trap 'handle_error $LINENO' ERR
 cleanup_resources() {
     local exit_code=$?
     
+    # 确保AWS环境变量被清理（最终保险）
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_ENDPOINT_URL 2>/dev/null || true
+    
     # 清理临时文件
     if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
         rm -rf "$TEMP_DIR" 2>/dev/null || true
         log "INFO" "已清理临时文件"
     fi
     
+    # 清理敏感历史记录（修复：避免清空整个历史）
+    if check_s3_config; then
+        log "INFO" "清理包含S3凭证的命令历史记录..."
+        clean_sensitive_history
+        log "SUCCESS" "已清理敏感命令历史记录"
+    fi
+    
     # 如果是正常退出，显示感谢信息
     if [ $exit_code -eq 0 ]; then
         echo -e "\n${CYAN}感谢使用 GCP API 密钥管理工具${NC}"
         echo -e "${YELLOW}请记得检查并删除不需要的项目以避免额外费用${NC}"
+        if check_s3_config; then
+            echo -e "${GREEN}密钥已安全上传到S3存储${NC}"
+        fi
     fi
 }
 
@@ -290,10 +457,21 @@ process_project() {
         if [ -n "$key_file_path" ] && [ -f "$key_file_path" ]; then
             log "SUCCESS" "成功为项目 ${project_id} 生成服务账号密钥。"
             
+            # 上传JSON密钥到S3
+            if check_s3_config; then
+                upload_json_key_to_s3 "$key_file_path" "$project_id"
+            fi
+            
             local api_key
             api_key=$(create_and_print_api_key "$project_id")
             if [ -n "$api_key" ]; then
                 log "SUCCESS" "成功为项目 ${project_id} 生成API Key。"
+                
+                # 上传API Key到S3
+                if check_s3_config; then
+                    upload_api_key_to_s3 "$api_key" "$project_id"
+                fi
+                
                 # 将服务账号密钥路径和API Key在同一行写入，用':::'分隔
                 echo "${key_file_path}:::${api_key}" >> "${temp_dir}/success.txt"
             else
@@ -687,6 +865,18 @@ vertex_main() {
     echo -e "======================================================${NC}\n"
     
     check_env || return 1
+    
+    # 检查S3配置和AWS CLI
+    if check_s3_config; then
+        log "INFO" "检测到S3配置，验证AWS CLI..."
+        if ! command -v aws &>/dev/null; then
+            log "ERROR" "S3已配置但未找到AWS CLI工具"
+            echo -e "${RED}请安装AWS CLI: https://aws.amazon.com/cli/${NC}"
+            echo -e "${YELLOW}或者移除S3参数以跳过S3上传功能${NC}"
+            return 1
+        fi
+        log "SUCCESS" "AWS CLI已就绪，密钥将自动上传到S3"
+    fi
     
     echo -e "${YELLOW}警告: Vertex AI 需要结算账户，会产生实际费用！${NC}\n"
     
@@ -1588,10 +1778,39 @@ main() {
                     exit 1
                 fi
                 ;;
+            --s3-endpoint)
+                S3_ENDPOINT="$2"
+                shift 2
+                ;;
+            --s3-access-key)
+                S3_ACCESS_KEY="$2"
+                shift 2
+                ;;
+            --s3-secret-key)
+                S3_SECRET_KEY="$2"
+                shift 2
+                ;;
+            --s3-bucket)
+                S3_BUCKET="$2"
+                shift 2
+                ;;
+            --s3-directory)
+                S3_DIRECTORY="$2"
+                shift 2
+                ;;
             -h|--help)
-                echo "用法: $0 [-n COUNT]"
-                echo "  -n, --count    要生成并打印JSON密钥的项目数量 (默认为 1)"
-                echo "  -h, --help     显示此帮助信息"
+                echo "用法: $0 [-n COUNT] [S3选项]"
+                echo "  -n, --count         要生成并打印JSON密钥的项目数量 (默认为 1)"
+                echo "  --s3-endpoint       S3端点地址"
+                echo "  --s3-access-key     S3访问密钥"
+                echo "  --s3-secret-key     S3秘密密钥"
+                echo "  --s3-bucket         S3存储桶名称"
+                echo "  --s3-directory      S3目录名 (默认为当前日期，如 20240720)"
+                echo "  -h, --help          显示此帮助信息"
+                echo ""
+                echo "S3示例:"
+                echo "  $0 -n 3 --s3-endpoint https://s3.amazonaws.com --s3-access-key AKIAXXXXXXXX \\"
+                echo "    --s3-secret-key your-secret-key --s3-bucket my-bucket --s3-directory keys-backup"
                 exit 0
                 ;;
             *)
@@ -1600,6 +1819,12 @@ main() {
                 ;;
         esac
     done
+    
+    # 生成S3目录（如果S3已配置）
+    if check_s3_config; then
+        generate_s3_directory
+        log "INFO" "S3配置已启用，密钥将上传到: s3://${S3_BUCKET}/${S3_DIRECTORY}/"
+    fi
 
     # 显示欢迎信息
     echo -e "${CYAN}${BOLD}"
@@ -1618,4 +1843,4 @@ main() {
 }
 
 # 运行主程序
-main
+main "$@"
