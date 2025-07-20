@@ -33,6 +33,7 @@ S3_ACCESS_KEY=""
 S3_SECRET_KEY=""
 S3_BUCKET=""
 S3_DIRECTORY=""
+S3_ENABLED=false  # S3功能是否可用
 
 # Gemini模式配置
 TIMESTAMP=$(date +%s)
@@ -101,6 +102,48 @@ check_s3_config() {
     return 0
 }
 
+# 检查S3上传工具的可用性（优先使用Google Cloud Shell内置工具）
+ensure_s3_tool() {
+    # 检查是否有s3cmd（Google Cloud Shell内置）
+    if command -v s3cmd &>/dev/null; then
+        log "SUCCESS" "找到s3cmd工具（Google Cloud Shell内置）"
+        return 0
+    fi
+    
+    # 检查是否有rclone（也是常见的S3工具）
+    if command -v rclone &>/dev/null; then
+        log "SUCCESS" "找到rclone工具"
+        return 0
+    fi
+    
+    # 检查AWS CLI
+    if command -v aws &>/dev/null; then
+        log "SUCCESS" "找到AWS CLI工具"
+        return 0
+    fi
+    
+    # 尝试安装AWS CLI（最后备选）
+    log "WARN" "未找到S3上传工具，尝试安装AWS CLI..."
+    if command -v python3 &>/dev/null; then
+        if python3 -m pip install --user awscli --quiet 2>/dev/null; then
+            log "SUCCESS" "AWS CLI安装成功"
+            export PATH="$HOME/.local/bin:$PATH"
+            return 0
+        fi
+    fi
+    
+    log "ERROR" "无法找到或安装S3上传工具"
+    return 1
+}
+
+# 检查S3功能是否可用（包括配置和AWS CLI）
+check_s3_available() {
+    if [ "$S3_ENABLED" = "true" ] && check_s3_config; then
+        return 0
+    fi
+    return 1
+}
+
 # 生成S3目录名（如果未指定）
 generate_s3_directory() {
     if [ -z "$S3_DIRECTORY" ]; then
@@ -109,49 +152,77 @@ generate_s3_directory() {
     fi
 }
 
-# 上传文件到S3
-upload_to_s3() {
+# ===== Google Cloud Storage 备用方案 =====
+
+# 上传文件到Google Cloud Storage（备用方案）
+upload_to_gcs() {
     local local_file="$1"
-    local s3_key="$2"
+    local gcs_bucket="$2"
+    local gcs_key="$3"
     
-    if ! check_s3_config; then
-        log "WARN" "S3配置不完整，跳过上传"
+    if [ ! -f "$local_file" ]; then
+        log "ERROR" "文件不存在: ${local_file}"
         return 1
     fi
     
-    if ! command -v aws &>/dev/null; then
-        log "ERROR" "未找到 aws CLI 工具，无法上传到S3"
+    if [ -z "$gcs_bucket" ] || [ -z "$gcs_key" ]; then
+        log "ERROR" "GCS存储桶或文件名为空"
         return 1
     fi
     
-    # 临时设置AWS凭证（避免暴露在history中）
-    export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
-    export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
-    export AWS_ENDPOINT_URL="$S3_ENDPOINT"
+    log "INFO" "上传文件到Google Cloud Storage: gs://${gcs_bucket}/${gcs_key}"
     
-    log "INFO" "上传文件到S3: s3://${S3_BUCKET}/${S3_DIRECTORY}/${s3_key}"
-    
-    # 安全修复：移除--no-verify-ssl选项，启用SSL验证
-    if aws s3 cp "$local_file" "s3://${S3_BUCKET}/${S3_DIRECTORY}/${s3_key}" 2>/dev/null; then
-        log "SUCCESS" "成功上传到S3: ${s3_key}"
-        # 立即清理环境变量（安全修复）
-        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_ENDPOINT_URL 2>/dev/null || true
+    if gsutil cp "$local_file" "gs://${gcs_bucket}/${gcs_key}" 2>/dev/null; then
+        log "SUCCESS" "成功上传到GCS: ${gcs_key}"
         return 0
     else
-        log "ERROR" "上传S3失败: ${s3_key}"
-        # 即使失败也要清理环境变量
-        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_ENDPOINT_URL 2>/dev/null || true
+        log "ERROR" "上传GCS失败: ${gcs_key}"
         return 1
     fi
 }
 
-# 上传JSON密钥到S3
-upload_json_key_to_s3() {
-    local json_file="$1"
-    local project_id="$2"
+# 创建GCS存储桶（如果不存在）
+ensure_gcs_bucket() {
+    local bucket_name="$1"
     
-    if [ ! -f "$json_file" ]; then
-        log "ERROR" "JSON文件不存在: ${json_file}"
+    if [ -z "$bucket_name" ]; then
+        log "ERROR" "GCS存储桶名为空"
+        return 1
+    fi
+    
+    # 检查存储桶是否存在
+    if gsutil ls -b "gs://${bucket_name}" &>/dev/null; then
+        log "INFO" "GCS存储桶已存在: ${bucket_name}"
+        return 0
+    fi
+    
+    # 尝试创建存储桶
+    log "INFO" "创建GCS存储桶: ${bucket_name}"
+    local current_project
+    current_project=$(gcloud config get-value project 2>/dev/null)
+    
+    if [ -z "$current_project" ]; then
+        log "ERROR" "无法获取当前项目，请设置默认项目"
+        return 1
+    fi
+    
+    if gsutil mb -p "$current_project" "gs://${bucket_name}" 2>/dev/null; then
+        log "SUCCESS" "GCS存储桶创建成功: ${bucket_name}"
+        return 0
+    else
+        log "ERROR" "GCS存储桶创建失败: ${bucket_name}"
+        return 1
+    fi
+}
+
+# 智能上传函数（优先S3，备用GCS）
+smart_upload() {
+    local local_file="$1"
+    local project_id="$2"
+    local file_type="$3" # "json" 或 "key"
+    
+    if [ ! -f "$local_file" ]; then
+        log "ERROR" "文件不存在: ${local_file}"
         return 1
     fi
     
@@ -164,10 +235,136 @@ upload_json_key_to_s3() {
         return 1
     fi
     
-    # 生成S3文件名
-    local s3_filename="${current_email}-${project_id}.json"
+    local file_extension
+    case "$file_type" in
+        "json") file_extension=".json" ;;
+        "key") file_extension=".key" ;;
+        *) file_extension="" ;;
+    esac
     
-    upload_to_s3 "$json_file" "$s3_filename"
+    local base_filename="${current_email}-${project_id}${file_extension}"
+    
+    # 尝试S3上传
+    if check_s3_available; then
+        if upload_to_s3 "$local_file" "$base_filename"; then
+            return 0
+        else
+            log "WARN" "S3上传失败，尝试GCS备用方案"
+        fi
+    fi
+    
+    # 尝试GCS备用方案
+    if command -v gsutil &>/dev/null; then
+        # 生成GCS存储桶名（基于项目ID或邮箱）
+        local gcs_bucket_name
+        gcs_bucket_name="vertex-keys-$(echo "$current_email" | cut -d'@' -f1 | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+        
+        # 确保存储桶存在
+        if ensure_gcs_bucket "$gcs_bucket_name"; then
+            local gcs_key="${S3_DIRECTORY:-$(date +%Y%m%d)}/${base_filename}"
+            if upload_to_gcs "$local_file" "$gcs_bucket_name" "$gcs_key"; then
+                log "INFO" "文件已上传到GCS作为备用: gs://${gcs_bucket_name}/${gcs_key}"
+                return 0
+            fi
+        fi
+    else
+        log "WARN" "gsutil不可用，无法使用GCS备用方案"
+    fi
+    
+    log "WARN" "所有上传方案都失败，文件仅保存在本地"
+    return 1
+}
+
+# 上传文件到S3（智能选择工具）
+upload_to_s3() {
+    local local_file="$1"
+    local s3_key="$2"
+    
+    if ! check_s3_available; then
+        log "WARN" "S3功能不可用，跳过上传"
+        return 1
+    fi
+    
+    local s3_url="s3://${S3_BUCKET}/${S3_DIRECTORY}/${s3_key}"
+    log "INFO" "上传文件到S3: ${s3_url}"
+    
+    # 方法1: 使用s3cmd（Google Cloud Shell内置）
+    if command -v s3cmd &>/dev/null; then
+        log "INFO" "使用s3cmd上传..."
+        # 配置s3cmd
+        local s3cmd_config="${TEMP_DIR}/s3cmd.cfg"
+        cat > "$s3cmd_config" << EOF
+[default]
+access_key = ${S3_ACCESS_KEY}
+secret_key = ${S3_SECRET_KEY}
+host_base = ${S3_ENDPOINT#https://}
+host_bucket = ${S3_ENDPOINT#https://}
+use_https = True
+EOF
+        
+        if s3cmd -c "$s3cmd_config" put "$local_file" "$s3_url" --quiet 2>/dev/null; then
+            log "SUCCESS" "成功上传到S3: ${s3_key}"
+            rm -f "$s3cmd_config"
+            return 0
+        else
+            log "ERROR" "s3cmd上传失败: ${s3_key}"
+            rm -f "$s3cmd_config"
+        fi
+    fi
+    
+    # 方法2: 使用rclone
+    if command -v rclone &>/dev/null; then
+        log "INFO" "使用rclone上传..."
+        local rclone_config="${TEMP_DIR}/rclone.conf"
+        cat > "$rclone_config" << EOF
+[s3remote]
+type = s3
+provider = Other
+access_key_id = ${S3_ACCESS_KEY}
+secret_access_key = ${S3_SECRET_KEY}
+endpoint = ${S3_ENDPOINT}
+EOF
+        
+        if rclone --config "$rclone_config" copy "$local_file" "s3remote:${S3_BUCKET}/${S3_DIRECTORY}/" --quiet 2>/dev/null; then
+            log "SUCCESS" "成功上传到S3: ${s3_key}"
+            rm -f "$rclone_config"
+            return 0
+        else
+            log "ERROR" "rclone上传失败: ${s3_key}"
+            rm -f "$rclone_config"
+        fi
+    fi
+    
+    # 方法3: 使用AWS CLI（备用）
+    if command -v aws &>/dev/null; then
+        log "INFO" "使用AWS CLI上传..."
+        # 临时设置AWS凭证
+        export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
+        export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
+        export AWS_ENDPOINT_URL="$S3_ENDPOINT"
+        
+        if aws s3 cp "$local_file" "$s3_url" 2>/dev/null; then
+            log "SUCCESS" "成功上传到S3: ${s3_key}"
+            # 清理环境变量
+            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_ENDPOINT_URL 2>/dev/null || true
+            return 0
+        else
+            log "ERROR" "AWS CLI上传失败: ${s3_key}"
+            # 清理环境变量
+            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_ENDPOINT_URL 2>/dev/null || true
+        fi
+    fi
+    
+    log "ERROR" "所有S3上传方法都失败了"
+    return 1
+}
+
+# 上传JSON密钥到S3
+upload_json_key_to_s3() {
+    local json_file="$1"
+    local project_id="$2"
+    
+    smart_upload "$json_file" "$project_id" "json"
 }
 
 # 上传API Key到S3
@@ -180,24 +377,12 @@ upload_api_key_to_s3() {
         return 1
     fi
     
-    # 获取当前活动账号邮箱
-    local current_email
-    current_email=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n 1)
-    
-    if [ -z "$current_email" ]; then
-        log "ERROR" "无法获取当前账号邮箱"
-        return 1
-    fi
-    
     # 创建临时文件保存API Key
-    local temp_key_file="${TEMP_DIR}/${current_email}-${project_id}.key"
+    local temp_key_file="${TEMP_DIR}/temp-api-key-${project_id}.key"
     echo "$api_key" > "$temp_key_file"
     
-    # 生成S3文件名
-    local s3_filename="${current_email}-${project_id}.key"
-    
     local result=0
-    upload_to_s3 "$temp_key_file" "$s3_filename" || result=1
+    smart_upload "$temp_key_file" "$project_id" "key" || result=1
     
     # 清理临时文件
     rm -f "$temp_key_file"
@@ -207,34 +392,37 @@ upload_api_key_to_s3() {
 
 # 清理敏感历史记录（安全修复）
 clean_sensitive_history() {
-    if ! command -v history &>/dev/null; then
-        log "WARN" "history命令不可用，跳过历史记录清理"
-        return 0
+    # 尝试清理包含敏感信息的历史记录
+    # 由于不同shell环境的差异，使用更稳健的方法
+    
+    local cleaned=false
+    
+    # 方法1: 尝试清理当前session的history
+    if command -v history &>/dev/null; then
+        # 清理当前session中的敏感命令
+        history -c 2>/dev/null && cleaned=true
     fi
     
-    # 查找并删除包含S3凭证的历史记录
-    local sensitive_patterns=("s3-secret-key" "s3-access-key" "--s3-secret-key" "--s3-access-key")
-    local deleted_count=0
-    
-    for pattern in "${sensitive_patterns[@]}"; do
-        # 使用history命令查找匹配的行号
-        local line_nums
-        line_nums=$(history | grep -n "$pattern" 2>/dev/null | cut -d: -f1 | tac)
-        
-        # 删除匹配的历史记录行
-        while IFS= read -r line_num; do
-            if [ -n "$line_num" ] && [[ "$line_num" =~ ^[0-9]+$ ]]; then
-                if history -d "$line_num" 2>/dev/null; then
-                    deleted_count=$((deleted_count + 1))
-                fi
+    # 方法2: 尝试清理history文件中的敏感信息
+    local history_files=("$HOME/.bash_history" "$HOME/.zsh_history")
+    for hist_file in "${history_files[@]}"; do
+        if [ -f "$hist_file" ] && [ -w "$hist_file" ]; then
+            # 备份原文件
+            cp "$hist_file" "${hist_file}.bak" 2>/dev/null
+            
+            # 删除包含敏感信息的行
+            if grep -v -E "(s3-secret-key|s3-access-key|--s3-secret-key|--s3-access-key)" "$hist_file" > "${hist_file}.tmp" 2>/dev/null; then
+                mv "${hist_file}.tmp" "$hist_file" 2>/dev/null && cleaned=true
+            else
+                rm -f "${hist_file}.tmp" 2>/dev/null
             fi
-        done <<< "$line_nums"
+        fi
     done
     
-    if [ "$deleted_count" -gt 0 ]; then
-        log "INFO" "已删除 ${deleted_count} 条包含敏感信息的历史记录"
+    if [ "$cleaned" = "true" ]; then
+        log "INFO" "已清理可能包含敏感信息的历史记录"
     else
-        log "INFO" "未发现包含敏感信息的历史记录"
+        log "WARN" "无法清理历史记录，请手动检查"
     fi
 }
 
@@ -294,8 +482,10 @@ cleanup_resources() {
     if [ $exit_code -eq 0 ]; then
         echo -e "\n${CYAN}感谢使用 GCP API 密钥管理工具${NC}"
         echo -e "${YELLOW}请记得检查并删除不需要的项目以避免额外费用${NC}"
-        if check_s3_config; then
+        if check_s3_available; then
             echo -e "${GREEN}密钥已安全上传到S3存储${NC}"
+        elif command -v gsutil &>/dev/null; then
+            echo -e "${GREEN}密钥已上传到Google Cloud Storage${NC}"
         fi
     fi
 }
@@ -457,8 +647,8 @@ process_project() {
         if [ -n "$key_file_path" ] && [ -f "$key_file_path" ]; then
             log "SUCCESS" "成功为项目 ${project_id} 生成服务账号密钥。"
             
-            # 上传JSON密钥到S3
-            if check_s3_config; then
+            # 上传JSON密钥到S3（如果配置了S3）
+            if check_s3_available; then
                 upload_json_key_to_s3 "$key_file_path" "$project_id"
             fi
             
@@ -467,8 +657,8 @@ process_project() {
             if [ -n "$api_key" ]; then
                 log "SUCCESS" "成功为项目 ${project_id} 生成API Key。"
                 
-                # 上传API Key到S3
-                if check_s3_config; then
+                # 上传API Key到S3（如果配置了S3）
+                if check_s3_available; then
                     upload_api_key_to_s3 "$api_key" "$project_id"
                 fi
                 
@@ -866,16 +1056,17 @@ vertex_main() {
     
     check_env || return 1
     
-    # 检查S3配置和AWS CLI
+    # 检查S3配置和上传工具
     if check_s3_config; then
-        log "INFO" "检测到S3配置，验证AWS CLI..."
-        if ! command -v aws &>/dev/null; then
-            log "ERROR" "S3已配置但未找到AWS CLI工具"
-            echo -e "${RED}请安装AWS CLI: https://aws.amazon.com/cli/${NC}"
-            echo -e "${YELLOW}或者移除S3参数以跳过S3上传功能${NC}"
-            return 1
+        log "INFO" "检测到S3配置，查找上传工具..."
+        if ensure_s3_tool; then
+            S3_ENABLED=true
+            log "SUCCESS" "S3上传工具已就绪，密钥将自动上传到S3"
+        else
+            S3_ENABLED=false
+            log "ERROR" "无法找到S3上传工具，密钥将仅保存在本地"
+            log "INFO" "提示: Google Cloud Shell通常内置s3cmd工具"
         fi
-        log "SUCCESS" "AWS CLI已就绪，密钥将自动上传到S3"
     fi
     
     echo -e "${YELLOW}警告: Vertex AI 需要结算账户，会产生实际费用！${NC}\n"
@@ -1823,7 +2014,8 @@ main() {
     # 生成S3目录（如果S3已配置）
     if check_s3_config; then
         generate_s3_directory
-        log "INFO" "S3配置已启用，密钥将上传到: s3://${S3_BUCKET}/${S3_DIRECTORY}/"
+        log "INFO" "S3配置已检测到，目标位置: s3://${S3_BUCKET}/${S3_DIRECTORY}/"
+        log "INFO" "S3上传功能将在检测到AWS CLI后启用"
     fi
 
     # 显示欢迎信息
@@ -1834,9 +2026,6 @@ main() {
     echo "║                  Vertex AI 专用版                     ║"
     echo "╚═══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-    
-    # 检查环境
-    check_env
     
     # 运行主程序逻辑，传递参数
     show_menu "$num_to_process"
