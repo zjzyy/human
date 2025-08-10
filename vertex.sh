@@ -19,7 +19,7 @@ BOLD='\033[1m'
 # ===== 全局配置 =====
 # 版本信息
 VERSION="8.8.8"
-LAST_UPDATED="2025-07-11"
+LAST_UPDATED="2025-08-10"
 
 # 通用配置
 PROJECT_PREFIX="${PROJECT_PREFIX:-gemini-key}"
@@ -392,37 +392,52 @@ upload_api_key_to_s3() {
 
 # 清理敏感历史记录（安全修复）
 clean_sensitive_history() {
-    # 尝试清理包含敏感信息的历史记录
-    # 由于不同shell环境的差异，使用更稳健的方法
-    
+    # 由于不同 shell 的行为差异，尽量采用“精确删除敏感行”的策略
+    # 目标：移除包含 S3/AWS 相关参数或凭证的历史记录
+
     local cleaned=false
-    
-    # 方法1: 尝试清理当前session的history
-    if command -v history &>/dev/null; then
-        # 清理当前session中的敏感命令
-        history -c 2>/dev/null && cleaned=true
-    fi
-    
-    # 方法2: 尝试清理history文件中的敏感信息
-    local history_files=("$HOME/.bash_history" "$HOME/.zsh_history")
+
+    # 构造匹配模式（基础关键字）
+    local base_pattern="(\\bgcpJSON\\.sh.*--s3-(endpoint|access-key|secret-key|bucket|directory)\\b|--s3-(endpoint|access-key|secret-key|bucket|directory)\\b|\\bS3_(ENDPOINT|ACCESS_KEY|SECRET_KEY|BUCKET|DIRECTORY)=|\\bAWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|ENDPOINT_URL)=|s3-access-key|s3-secret-key)"
+
+    # 如果变量非空，将其字面量加入匹配，确保包含具体值的行也被移除
+    escape_regex() { printf '%s' "$1" | sed -E 's/[][(){}.^$*+?|\\/]/\\&/g'; }
+    local extra=""
+    [ -n "${S3_ENDPOINT:-}" ]   && extra+="|$(escape_regex "$S3_ENDPOINT")"
+    [ -n "${S3_ACCESS_KEY:-}" ] && extra+="|$(escape_regex "$S3_ACCESS_KEY")"
+    [ -n "${S3_SECRET_KEY:-}" ] && extra+="|$(escape_regex "$S3_SECRET_KEY")"
+    [ -n "${S3_BUCKET:-}" ]     && extra+="|$(escape_regex "$S3_BUCKET")"
+    [ -n "${S3_DIRECTORY:-}" ]  && extra+="|$(escape_regex "$S3_DIRECTORY")"
+
+    local pattern="${base_pattern}${extra}"
+
+    # 优先尝试清空当前子 shell 会话的历史（对父 shell 可能无效，但不影响文件级处理）
+    history -c 2>/dev/null || true
+
+    # 覆盖常见 shell 历史文件
+    local history_files=(
+        "$HOME/.bash_history"
+        "$HOME/.zsh_history"
+    )
+
     for hist_file in "${history_files[@]}"; do
         if [ -f "$hist_file" ] && [ -w "$hist_file" ]; then
-            # 备份原文件
-            cp "$hist_file" "${hist_file}.bak" 2>/dev/null
-            
-            # 删除包含敏感信息的行
-            if grep -v -E "(s3-secret-key|s3-access-key|--s3-secret-key|--s3-access-key)" "$hist_file" > "${hist_file}.tmp" 2>/dev/null; then
+            cp "$hist_file" "${hist_file}.bak" 2>/dev/null || true
+            if grep -v -E "$pattern" "$hist_file" > "${hist_file}.tmp" 2>/dev/null; then
                 mv "${hist_file}.tmp" "$hist_file" 2>/dev/null && cleaned=true
             else
-                rm -f "${hist_file}.tmp" 2>/dev/null
+                rm -f "${hist_file}.tmp" 2>/dev/null || true
             fi
         fi
     done
-    
+
+    # 同步到磁盘
+    sync 2>/dev/null || true
+
     if [ "$cleaned" = "true" ]; then
-        log "INFO" "已清理可能包含敏感信息的历史记录"
+        log "SUCCESS" "已从历史文件中移除可能包含 S3/AWS 信息的记录"
     else
-        log "WARN" "无法清理历史记录，请手动检查"
+        log "WARN" "未能修改历史文件或无匹配项（请确认使用了 S3 相关参数）"
     fi
 }
 
@@ -471,11 +486,10 @@ cleanup_resources() {
         log "INFO" "已清理临时文件"
     fi
     
-    # 清理敏感历史记录（修复：避免清空整个历史）
-    if check_s3_config; then
-        log "INFO" "清理包含S3凭证的命令历史记录..."
+    # 清理敏感历史记录：只要任一 S3 相关变量非空即执行（不再要求完整配置）
+    if [ -n "${S3_ENDPOINT}${S3_ACCESS_KEY}${S3_SECRET_KEY}${S3_BUCKET}${S3_DIRECTORY}" ] || [ "${S3_ENABLED}" = "true" ]; then
+        log "INFO" "清理包含 S3/AWS 信息的命令历史记录..."
         clean_sensitive_history
-        log "SUCCESS" "已清理敏感命令历史记录"
     fi
     
     # 如果是正常退出，显示感谢信息
