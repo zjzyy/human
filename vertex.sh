@@ -62,9 +62,10 @@ ENABLE_EXTRA_ROLES=("roles/iam.serviceAccountUser" "roles/aiplatform.user")
 # ===== 初始化 =====
 # 禁用历史记录功能（从一开始就防止记录）
 set +o history 2>/dev/null || true
-unset HISTFILE 2>/dev/null || true
-HISTSIZE=0 2>/dev/null || true
-HISTFILESIZE=0 2>/dev/null || true
+# 使用安全的方式处理可能未定义的变量
+[ -n "${HISTFILE:-}" ] && unset HISTFILE 2>/dev/null || true
+export HISTSIZE=0 2>/dev/null || true
+export HISTFILESIZE=0 2>/dev/null || true
 
 # 创建唯一的临时目录
 TEMP_DIR=$(mktemp -d -t gcp_script_XXXXXX) || {
@@ -410,8 +411,12 @@ clear_all_history() {
         "$HOME/.bash_history"
         "$HOME/.zsh_history"
         "$HOME/.sh_history"
-        "$HISTFILE"  # 如果设置了HISTFILE环境变量
     )
+    
+    # 安全地添加HISTFILE（如果已定义）
+    if [ -n "${HISTFILE:-}" ]; then
+        history_files+=("$HISTFILE")
+    fi
     
     for hist_file in "${history_files[@]}"; do
         if [ -n "$hist_file" ] && [ -f "$hist_file" ] && [ -w "$hist_file" ]; then
@@ -434,14 +439,19 @@ clear_all_history() {
     
     # 3. 对于bash，尝试清空历史列表
     if [ -n "${BASH_VERSION:-}" ]; then
+        # 保存原始值
+        local orig_histsize="${HISTSIZE:-1000}"
+        local orig_histfilesize="${HISTFILESIZE:-2000}"
+        
         # 清空bash历史列表
-        HISTSIZE=0
-        HISTFILESIZE=0
+        export HISTSIZE=0
+        export HISTFILESIZE=0
         history -c 2>/dev/null || true
         history -w 2>/dev/null || true
+        
         # 恢复默认大小（但不加载历史）
-        HISTSIZE=1000
-        HISTFILESIZE=2000
+        export HISTSIZE="$orig_histsize"
+        export HISTFILESIZE="$orig_histfilesize"
     fi
     
     # 4. 对于zsh，尝试清空历史
@@ -454,20 +464,20 @@ clear_all_history() {
     # 5. 同步到磁盘，确保更改生效
     sync 2>/dev/null || true
     
-    # 6. 尝试向父shell发送信号清空历史（可能不生效，但值得尝试）
-    if [ -n "${PPID:-}" ]; then
-        # 尝试通知父进程重新读取历史（实际效果取决于shell配置）
-        kill -USR1 $PPID 2>/dev/null || true
-    fi
+    # 6. 创建一个标记文件，提示用户需要手动清理父shell历史
+    local marker_file="${HOME}/.gcpJSON_history_cleared"
+    echo "历史已在 $(date) 清空" > "$marker_file"
     
     if [ "$cleared" = "true" ]; then
-        log "SUCCESS" "所有历史记录已彻底清空"
+        log "SUCCESS" "历史文件已清空"
+        log "INFO" "注意：如果您在父shell中运行此脚本，请手动执行以下命令："
+        echo -e "${YELLOW}history -c && history -w${NC}" >&2
     else
         log "WARN" "未找到可清空的历史文件或无写入权限"
     fi
     
-    # 防止当前命令被记录到历史
-    unset HISTFILE 2>/dev/null || true
+    # 防止当前命令被记录到历史（使用安全的方式）
+    [ -n "${HISTFILE:-}" ] && unset HISTFILE 2>/dev/null || true
     set +o history 2>/dev/null || true
 }
 
@@ -529,7 +539,9 @@ cleanup_resources() {
         elif command -v gsutil &>/dev/null; then
             echo -e "${GREEN}密钥已上传到Google Cloud Storage${NC}"
         fi
-        echo -e "${PURPLE}${BOLD}历史记录已完全清空，保护您的操作隐私${NC}"
+        echo -e "${PURPLE}${BOLD}历史文件已清空${NC}"
+        echo -e "${YELLOW}提示：要清空当前shell的历史，请手动执行：${NC}"
+        echo -e "${GREEN}history -c && history -w${NC}"
     fi
 }
 
