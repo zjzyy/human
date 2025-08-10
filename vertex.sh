@@ -62,8 +62,10 @@ ENABLE_EXTRA_ROLES=("roles/iam.serviceAccountUser" "roles/aiplatform.user")
 # ===== 初始化 =====
 # 禁用历史记录功能（从一开始就防止记录）
 set +o history 2>/dev/null || true
-# 使用安全的方式处理可能未定义的变量
-[ -n "${HISTFILE:-}" ] && unset HISTFILE 2>/dev/null || true
+# 使用更安全的方式处理可能未定义的变量
+if [ -n "${HISTFILE+x}" ]; then  # 检查变量是否已设置（不检查值）
+    unset HISTFILE 2>/dev/null || true
+fi
 export HISTSIZE=0 2>/dev/null || true
 export HISTFILESIZE=0 2>/dev/null || true
 
@@ -406,16 +408,16 @@ clear_all_history() {
     # 1. 清空当前shell会话的内存历史
     history -c 2>/dev/null || true
     
-    # 2. 清空所有常见的历史文件
-    local history_files=(
-        "$HOME/.bash_history"
-        "$HOME/.zsh_history"
-        "$HOME/.sh_history"
-    )
+    # 2. 构建历史文件列表
+    local history_files=()
+    history_files+=("$HOME/.bash_history")
+    history_files+=("$HOME/.zsh_history")
+    history_files+=("$HOME/.sh_history")
     
-    # 安全地添加HISTFILE（如果已定义）
-    if [ -n "${HISTFILE:-}" ]; then
-        history_files+=("$HISTFILE")
+    # 安全地添加HISTFILE（如果已定义）- 避免在数组初始化时使用
+    local hist_file_var="${HISTFILE:-}"
+    if [ -n "$hist_file_var" ]; then
+        history_files+=("$hist_file_var")
     fi
     
     for hist_file in "${history_files[@]}"; do
@@ -439,7 +441,7 @@ clear_all_history() {
     
     # 3. 对于bash，尝试清空历史列表
     if [ -n "${BASH_VERSION:-}" ]; then
-        # 保存原始值
+        # 保存原始值（使用安全的默认值）
         local orig_histsize="${HISTSIZE:-1000}"
         local orig_histfilesize="${HISTFILESIZE:-2000}"
         
@@ -476,8 +478,10 @@ clear_all_history() {
         log "WARN" "未找到可清空的历史文件或无写入权限"
     fi
     
-    # 防止当前命令被记录到历史（使用安全的方式）
-    [ -n "${HISTFILE:-}" ] && unset HISTFILE 2>/dev/null || true
+    # 防止当前命令被记录到历史（使用更安全的方式）
+    if [ -n "${HISTFILE+x}" ]; then  # 检查变量是否已设置
+        unset HISTFILE 2>/dev/null || true
+    fi
     set +o history 2>/dev/null || true
 }
 
