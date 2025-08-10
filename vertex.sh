@@ -60,6 +60,12 @@ KEY_DIR="${KEY_DIR:-./keys}"
 ENABLE_EXTRA_ROLES=("roles/iam.serviceAccountUser" "roles/aiplatform.user")
 
 # ===== 初始化 =====
+# 禁用历史记录功能（从一开始就防止记录）
+set +o history 2>/dev/null || true
+unset HISTFILE 2>/dev/null || true
+HISTSIZE=0 2>/dev/null || true
+HISTFILESIZE=0 2>/dev/null || true
+
 # 创建唯一的临时目录
 TEMP_DIR=$(mktemp -d -t gcp_script_XXXXXX) || {
     echo "错误：无法创建临时目录"
@@ -390,55 +396,79 @@ upload_api_key_to_s3() {
     return $result
 }
 
-# 清理敏感历史记录（安全修复）
-clean_sensitive_history() {
-    # 由于不同 shell 的行为差异，尽量采用“精确删除敏感行”的策略
-    # 目标：移除包含 S3/AWS 相关参数或凭证的历史记录
-
-    local cleaned=false
-
-    # 构造匹配模式（基础关键字）
-    local base_pattern="(\\bgcpJSON\\.sh.*--s3-(endpoint|access-key|secret-key|bucket|directory)\\b|--s3-(endpoint|access-key|secret-key|bucket|directory)\\b|\\bS3_(ENDPOINT|ACCESS_KEY|SECRET_KEY|BUCKET|DIRECTORY)=|\\bAWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|ENDPOINT_URL)=|s3-access-key|s3-secret-key)"
-
-    # 如果变量非空，将其字面量加入匹配，确保包含具体值的行也被移除
-    escape_regex() { printf '%s' "$1" | sed -E 's/[][(){}.^$*+?|\\/]/\\&/g'; }
-    local extra=""
-    [ -n "${S3_ENDPOINT:-}" ]   && extra+="|$(escape_regex "$S3_ENDPOINT")"
-    [ -n "${S3_ACCESS_KEY:-}" ] && extra+="|$(escape_regex "$S3_ACCESS_KEY")"
-    [ -n "${S3_SECRET_KEY:-}" ] && extra+="|$(escape_regex "$S3_SECRET_KEY")"
-    [ -n "${S3_BUCKET:-}" ]     && extra+="|$(escape_regex "$S3_BUCKET")"
-    [ -n "${S3_DIRECTORY:-}" ]  && extra+="|$(escape_regex "$S3_DIRECTORY")"
-
-    local pattern="${base_pattern}${extra}"
-
-    # 优先尝试清空当前子 shell 会话的历史（对父 shell 可能无效，但不影响文件级处理）
+# 彻底清空所有历史记录
+clear_all_history() {
+    log "INFO" "开始清空所有历史记录..."
+    
+    local cleared=false
+    
+    # 1. 清空当前shell会话的内存历史
     history -c 2>/dev/null || true
-
-    # 覆盖常见 shell 历史文件
+    
+    # 2. 清空所有常见的历史文件
     local history_files=(
         "$HOME/.bash_history"
         "$HOME/.zsh_history"
+        "$HOME/.sh_history"
+        "$HISTFILE"  # 如果设置了HISTFILE环境变量
     )
-
+    
     for hist_file in "${history_files[@]}"; do
-        if [ -f "$hist_file" ] && [ -w "$hist_file" ]; then
-            cp "$hist_file" "${hist_file}.bak" 2>/dev/null || true
-            if grep -v -E "$pattern" "$hist_file" > "${hist_file}.tmp" 2>/dev/null; then
-                mv "${hist_file}.tmp" "$hist_file" 2>/dev/null && cleaned=true
-            else
-                rm -f "${hist_file}.tmp" 2>/dev/null || true
-            fi
+        if [ -n "$hist_file" ] && [ -f "$hist_file" ] && [ -w "$hist_file" ]; then
+            # 备份原始历史文件（以防需要恢复）
+            cp "$hist_file" "${hist_file}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+            
+            # 彻底清空历史文件
+            > "$hist_file" 2>/dev/null && {
+                cleared=true
+                log "SUCCESS" "已清空历史文件: ${hist_file}"
+            } || {
+                # 如果直接清空失败，尝试删除后重建
+                rm -f "$hist_file" 2>/dev/null && touch "$hist_file" 2>/dev/null && {
+                    cleared=true
+                    log "SUCCESS" "已重建历史文件: ${hist_file}"
+                }
+            }
         fi
     done
-
-    # 同步到磁盘
-    sync 2>/dev/null || true
-
-    if [ "$cleaned" = "true" ]; then
-        log "SUCCESS" "已从历史文件中移除可能包含 S3/AWS 信息的记录"
-    else
-        log "WARN" "未能修改历史文件或无匹配项（请确认使用了 S3 相关参数）"
+    
+    # 3. 对于bash，尝试清空历史列表
+    if [ -n "${BASH_VERSION:-}" ]; then
+        # 清空bash历史列表
+        HISTSIZE=0
+        HISTFILESIZE=0
+        history -c 2>/dev/null || true
+        history -w 2>/dev/null || true
+        # 恢复默认大小（但不加载历史）
+        HISTSIZE=1000
+        HISTFILESIZE=2000
     fi
+    
+    # 4. 对于zsh，尝试清空历史
+    if [ -n "${ZSH_VERSION:-}" ]; then
+        # 清空zsh历史
+        fc -p 2>/dev/null || true
+        fc -P 2>/dev/null || true
+    fi
+    
+    # 5. 同步到磁盘，确保更改生效
+    sync 2>/dev/null || true
+    
+    # 6. 尝试向父shell发送信号清空历史（可能不生效，但值得尝试）
+    if [ -n "${PPID:-}" ]; then
+        # 尝试通知父进程重新读取历史（实际效果取决于shell配置）
+        kill -USR1 $PPID 2>/dev/null || true
+    fi
+    
+    if [ "$cleared" = "true" ]; then
+        log "SUCCESS" "所有历史记录已彻底清空"
+    else
+        log "WARN" "未找到可清空的历史文件或无写入权限"
+    fi
+    
+    # 防止当前命令被记录到历史
+    unset HISTFILE 2>/dev/null || true
+    set +o history 2>/dev/null || true
 }
 
 # ===== 错误处理 =====
@@ -486,11 +516,9 @@ cleanup_resources() {
         log "INFO" "已清理临时文件"
     fi
     
-    # 清理敏感历史记录：只要任一 S3 相关变量非空即执行（不再要求完整配置）
-    if [ -n "${S3_ENDPOINT}${S3_ACCESS_KEY}${S3_SECRET_KEY}${S3_BUCKET}${S3_DIRECTORY}" ] || [ "${S3_ENABLED}" = "true" ]; then
-        log "INFO" "清理包含 S3/AWS 信息的命令历史记录..."
-        clean_sensitive_history
-    fi
+    # 无条件清空所有历史记录（确保不留痕迹）
+    log "INFO" "执行完整历史记录清理..."
+    clear_all_history
     
     # 如果是正常退出，显示感谢信息
     if [ $exit_code -eq 0 ]; then
@@ -501,6 +529,7 @@ cleanup_resources() {
         elif command -v gsutil &>/dev/null; then
             echo -e "${GREEN}密钥已上传到Google Cloud Storage${NC}"
         fi
+        echo -e "${PURPLE}${BOLD}历史记录已完全清空，保护您的操作隐私${NC}"
     fi
 }
 
